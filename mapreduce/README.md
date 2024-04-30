@@ -1,6 +1,6 @@
 # Project 3: MapReduce
 
-## Introduction (MY WORKING CODE IS IN NEWBRANCH. THIS WAS MY FIRST ATTEMPT AT MR)
+## Introduction
 
 In this lab you'll build a MapReduce system. You'll implement a worker process that calls application Map and Reduce functions and handles reading and writing files, and a coordinator process that hands out tasks to workers and copes with failed workers. You'll be building something similar to the [MapReduce paper](http://static.googleusercontent.com/media/research.google.com/en//archive/mapreduce-osdi04.pdf).
 
