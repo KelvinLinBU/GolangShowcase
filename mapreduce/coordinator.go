@@ -385,3 +385,4 @@ func (c *Coordinator) server() {
 	}
 	go http.Serve(l, nil)
 }
+
