@@ -1,241 +1,125 @@
 package mr
 
 import (
-	"errors"
-	"path/filepath"
-	"regexp"
-	"strings"
-
-	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/rpc"
 	"os"
+	"regexp"
+	"strconv"
 	"sync"
+	"time"
+)
+
+type Workerstatus string //struct to keep track of a worker's status
+const (
+	DoingNothingReadyForTask = "DoingNothingReadyForTask" //wprker is ready to be assigned a task
+	Working                  = "Working"                  //worker is currently working
+	Done                     = "Done"                     //the task is done
+	Fail                     = "Fail"                     //the task has failed and mnust be reassigned to a different worker
 )
 
 type Coordinator struct {
-	// Your definitions here.
-	reduce_task_count      int        //nReduce tasks
-	file_slice             []string   //original files of data
-	tasks_to_complete      []string   //slice for tasks to complete
-	phase                  string     //map or reduce phase
-	mu                     sync.Mutex //mutex
-	map_task_nums          []int
-	reduce_tasks_slice     []string
-	reduce_tasks_completed int //how many reduce tasks completed
+	tasks_path_names []string                      //task path names
+	n_reduces        int                           //n reduce buckets
+	mu               sync.Mutex                    //mutex
+	mapping_tasks    map[int]*InformationaboutTask //mapping the tasks into a map of struct InformationaboutTask
+	reducing_tasks   map[int]*InformationaboutTask //information about reduces
+	job_completion   bool                          //make sure job is completed
+	waitgroup        sync.WaitGroup                //waitgroup for timer
+
+}
+
+type InformationaboutTask struct {
+	time_started    time.Time    //value to be used for in timer
+	worker_name     string       //worker it is going to be assigned to
+	status          Workerstatus //the status of the worker, check the struct for this
+	filesintaskpath []string     //files in the assigned path
 }
 
 // Your code here -- RPC handlers for the worker to call.
-func (c *Coordinator) initialize_maptasknum_slice() []int {
-	result := []int{}
-	for i := 0; i < len(c.tasks_to_complete); i++ {
-		result = append(result, i)
-	}
-	return result
-}
-
-func (c *Coordinator) Reply_Handler(args *Args_Worker_Can_Work, reply *Args_Task_Assignment_to_Worker) error {
-	// Check if the worker is ready to work
-	if args.Work_Yes_or_No != 1 {
-		return errors.New("worker cannot work")
-	}
-
-	c.mu.Lock()
-
-	switch c.phase {
-	case "done":
-		os.Exit(1)
-	case "map":
-		if len(c.tasks_to_complete) == 0 {
-			reply.Maporreduce = "wait" // No map tasks left, instruct the worker to wait
+func (c *Coordinator) Worker_Being_Assigned_Task(GivemeTask *ArgsGivemeTask, TasktoComplete *ArgsTasktoComplete) error {
+	c.mu.Lock()                                   //lock coordinator
+	defer c.mu.Unlock()                           //unlock coordinator
+	for id, assignment := range c.mapping_tasks { //go through the map
+		if assignment.status == "DoingNothingReadyForTask" { //if worker is idle
+			assignment.status = "Working"                         //task is being executed
+			assignment.worker_name = GivemeTask.Uniqueworkervalue //set unique worker value
+			TasktoComplete.TaskName = id                          //set task id name
+			TasktoComplete.Buckets = c.n_reduces                  //set n_reduces for buckets
+			TasktoComplete.Filenames = assignment.filesintaskpath //set files for mapping
+			TasktoComplete.TasktoCompleteAssignment = Map_Phase   //tell job is map job
+			assignment.time_started = time.Now()                  //time started, added on to time for timeout
 			return nil
 		}
-		// Assign a map task to the worker
-		reply.Maporreduce = c.phase
-		reply.Tasknumber = c.map_task_nums[0]
-
-		reply.Nreduce = c.reduce_task_count
-		reply.Reply_path = c.tasks_to_complete[0]
-
-		// Update the slices to reflect the assigned task
-		c.tasks_to_complete = c.tasks_to_complete[1:]
-
-		c.map_task_nums = c.map_task_nums[1:]
-
-		// Update phase to wait if there are no more tasks to complete
-		if len(c.tasks_to_complete) == 0 {
-			c.phase = "wait"
+		if assignment.status == "Fail" { //if worker failed
+			assignment.status = "Working"                         //task is being executed
+			assignment.worker_name = GivemeTask.Uniqueworkervalue //set unique worker value
+			TasktoComplete.TaskName = id                          //set task id name
+			TasktoComplete.Buckets = c.n_reduces                  //set n_reduces for buckets
+			TasktoComplete.Filenames = assignment.filesintaskpath //set files for mapping
+			TasktoComplete.TasktoCompleteAssignment = Map_Phase   //tell job is map job
+			assignment.time_started = time.Now()                  //time started, added on to time for timeout
+			return nil
 		}
-		c.mu.Unlock()
-	case "wait":
-		// Directly tell the worker to wait, nothing more to do
-		reply.Maporreduce = "wait"
-		c.mu.Unlock()
-
-	case "reduce":
-		// If in reduce phase, this implies all map tasks are done. Specific logic for assigning reduce tasks would go here.
-		// This example does not include detailed logic for assigning reduce tasks, as it would depend on your overall design
-		//go through the directory, split into buckets
-
-		reply.Maporreduce = c.phase //reduce phase
-
-		reply.Reply_path = c.reduce_tasks_slice[0]  //reduce tasks slice
-		reply.Tasknumber = c.reduce_tasks_completed //task number
-		// Update the slices to reflect the assigned task
-		c.mu.Unlock()
-		//this should be all the information the worker needs
-
-	default:
-		// Handle unexpected phase
-		c.mu.Unlock()
-		return fmt.Errorf("unhandled phase: %s", c.phase)
-
 	}
+	variable := 0 //variable to keep track of whether map tasks are done yet
 
-	return nil
-}
+	for _, maps := range c.mapping_tasks { //go through coordinator map tasks left
 
-func copyFile(src, dst string) error {
-	srcFile, err := os.Open(src)
-	if err != nil {
-		return err
+		if maps.status != Done { //if they are not done...
+			variable += 1 //then variable != 0
+
+		}
 	}
-	defer srcFile.Close()
+	if variable == 0 { //if no map tasks left, that means only reduces left
+		for id, assignment := range c.reducing_tasks {
 
-	dstFile, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer dstFile.Close()
-
-	if _, err := io.Copy(dstFile, srcFile); err != nil {
-		return err
+			if assignment.status == "DoingNothingReadyForTask" { //if worker is idle
+				assignment.status = "Working"                          //task is being executed
+				assignment.worker_name = GivemeTask.Uniqueworkervalue  //set unique worker value
+				TasktoComplete.TaskName = id                           //set task id name
+				TasktoComplete.Buckets = c.n_reduces                   //set n_reduces for buckets
+				TasktoComplete.Filenames = assignment.filesintaskpath  //set files for mapping
+				TasktoComplete.TasktoCompleteAssignment = Reduce_Phase //tell job is reduce job
+				assignment.time_started = time.Now()                   //time started
+				return nil
+			}
+			if assignment.status == "Fail" { //if worker failed
+				assignment.status = "Working"                          //task is being executed
+				assignment.worker_name = GivemeTask.Uniqueworkervalue  //set unique worker value
+				TasktoComplete.TaskName = id                           //set task id name
+				TasktoComplete.Buckets = c.n_reduces                   //set n_reduces for buckets
+				TasktoComplete.Filenames = assignment.filesintaskpath  //set files for mapping
+				TasktoComplete.TasktoCompleteAssignment = Reduce_Phase //tell job is reduce job
+				assignment.time_started = time.Now()                   //time started
+				return nil
+			}
+		}
 	}
 	return nil
 }
 
-func (c *Coordinator) Reduce_Success_Or_Failure_Handler(args *Args_Status, reply *Args_Status_Reply) error {
+// hmmmmm
+func get_Reduce_Task_Name(filename string) int {
 
-	c.mu.Lock()
+	re := regexp.MustCompile(`mr-(\d+)-(\d+)\.txt`)
 
-	c.reduce_tasks_completed += 1
-
-	c.reduce_tasks_slice = c.reduce_tasks_slice[1:] //
-
-	if c.reduce_tasks_completed > c.reduce_task_count {
-
-		/*fmt.Println("done")
-		dir := "." // Directory to search, "." means the current directory
-		files, err := ioutil.ReadDir(dir)
+	// Find submatches in the filename
+	matches := re.FindStringSubmatch(filename)
+	if len(matches) == 3 {
+		// Convert the captured string (the reduce task ID) to an integer
+		reduceTaskID, err := strconv.Atoi(matches[2])
 		if err != nil {
-			log.Fatal(err)
+			log.Panicf("error converting reduce task id to integer: %v\n", err)
 		}
-
-		// Aggregate map
-		aggregates := make(map[string]int)
-
-		for _, file := range files {
-			if strings.HasPrefix(file.Name(), "mr-out") {
-				processFile(dir+"/"+file.Name(), aggregates)
-			}
-		}
-
-		// Create or truncate the output file
-		outputFile, err := os.Create("mr-out-*")
-		if err != nil {
-			log.Fatalf("Failed to create output file: %v", err)
-		}
-		defer outputFile.Close()
-
-		// Write the aggregated results to the file
-		for key, sum := range aggregates {
-			_, err := outputFile.WriteString(fmt.Sprintf("%s %d\n", key, sum))
-			if err != nil {
-				log.Fatalf("Failed to write to output file: %v", err)
-			}
-		}
-		*/
-
-		c.phase = "done"
-		remove()
-		//os.Exit(1)
+		return reduceTaskID
 	}
 
-	c.mu.Unlock()
-	return nil
-}
-
-func (c *Coordinator) Success_Or_Failure_Handler(args *Args_Status, reply *Args_Status_Reply) error {
-	c.mu.Lock()
-
-	filepathname := args.Path
-	map_num := args.Map_task_num
-	if args.SuccessorFailure { //if successful RPC
-		//no need to append back
-
-		if len(c.tasks_to_complete) == 0 {
-
-			c.phase = "reduce"   //set phase to reduce
-			dirPath := "."       // Directory containing MapReduce output files
-			targetBaseDir := "." // Base directory for sorted output
-
-			// Compile a regex to match files named mr-X-Y, capturing X and Y
-			filePattern := regexp.MustCompile(`^mr-(\d+)-(\d+).json`)
-
-			// Read the directory
-			entries, err := os.ReadDir(dirPath)
-			if err != nil {
-				log.Fatalf("Error reading directory: %v", err)
-			}
-
-			for _, entry := range entries {
-				if entry.IsDir() {
-					continue // Skip directories
-				}
-
-				filename := entry.Name()
-				matches := filePattern.FindStringSubmatch(filename)
-				if matches == nil {
-					continue // Skip files that do not match the pattern
-				}
-
-				reduceTaskNum := matches[2] // Capture group 2 is the reduce task number (Y)
-
-				targetDir := filepath.Join(targetBaseDir, fmt.Sprintf("reduce-task-%s", reduceTaskNum))
-				c.reduce_tasks_slice = append(c.reduce_tasks_slice, fmt.Sprintf("reduce-task-%s", reduceTaskNum)) //append to reduce tasks
-				// Create the target directory if it doesn't exist
-				if err := os.MkdirAll(targetDir, 0755); err != nil {
-					log.Fatalf("Error creating directory %s: %v", targetDir, err)
-				}
-
-				// Copy the file to the target directory
-				srcPath := filepath.Join(dirPath, filename)
-				destPath := filepath.Join(targetDir, filename)
-				if err := copyFile(srcPath, destPath); err != nil {
-					log.Fatalf("Error copying file from %s to %s: %v", srcPath, destPath, err)
-				} else {
-
-				}
-			}
-
-			c.phase = "reduce"
-
-			//set tasks to reduce
-		}
-		c.mu.Unlock()
-		return nil
-	} else { //if not successful RPC
-		//append back the file path
-
-		c.tasks_to_complete = append(c.tasks_to_complete, filepathname) //add task back to queue
-		c.map_task_nums = append(c.map_task_nums, map_num)              //add corresponding number back to queue
-		c.phase = "map"                                                 //change phase back to mapping phase
-		c.mu.Unlock()
-		return nil
-	}
+	// If the format does not match, log an error and panic
+	log.Panicf("couldn't parse reduce task id from filename %v\n", filename)
+	return -1
 }
 
 // an example RPC handler.
@@ -249,126 +133,115 @@ func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
 // if the entire job has finished.
 func (c *Coordinator) Done() bool {
 	ret := false
-
-	dirPath, err := os.Getwd() // Example directory path
-	if err != nil {
-		fmt.Println(err)
-	}
+	variable := 0 //variable to keep track of whether map tasks are done yet
 	c.mu.Lock()
-	nReduce := c.reduce_task_count // Example number of reduce tasks
-	c.mu.Unlock()
-	if checkForAllReduceOutputs(dirPath, nReduce) {
-		c.mu.Lock()
-		c.phase = "done"
-		c.mu.Unlock()
-		ret = true
-	} else {
-		fmt.Println("Not done yet")
+	for _, maps := range c.mapping_tasks { //go through coordinator map tasks left
+		if maps.status != Done { //if they are not done...
+			variable += 1 //then variable != 0
+		}
 	}
+	for _, reduces := range c.reducing_tasks { //go through coordinator reduce tasks left
+		if reduces.status != Done { //if they are not done...
+			variable += 1 //then variable != 0
+		}
+	}
+	c.mu.Unlock()
+	if variable == 0 { //if variable == 0 then that means there are no tasks to be done anymore
+		return true
+	}
+	// Your code here.
 
 	return ret
 }
 
-// checkForAllReduceOutputs checks if there are files named "mr-out-X" for each X up to nReduce.
-func checkForAllReduceOutputs(dirPath string, nReduce int) bool {
-	expectedFiles := make(map[int]bool)
-
-	// Initialize map to track which reduce files we expect to find
-	for i := 1; i <= nReduce; i++ {
-		expectedFiles[i] = false
-	}
-
-	// Function to be called for each file and directory in dirPath
-	checkFile := func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err // Propagate any error and stop walking the directory
-		}
-		if !info.IsDir() { // If this is a file
-			var num int
-			_, err := fmt.Sscanf(filepath.Base(path), "mr-out-%d", &num)
-			if err == nil {
-				// If the filename matches the expected format and the number is within our range
-				if _, exists := expectedFiles[num]; exists {
-					expectedFiles[num] = true
+func (c *Coordinator) Success_Handler(args *ArgsWorkerSuccess, reply *ArgsGotit) error {
+	if args.Phase == Map_Phase {
+		information_from_map_completed := c.mapping_tasks[args.TaskName] //it was a success, then remove the job from the queue
+		c.mu.Lock()
+		if information_from_map_completed.status != Done { //if it is not done
+			information_from_map_completed.status = Done //then mark it done
+			for _, mapintermediate := range args.Filenames {
+				reduceTaskID := get_Reduce_Task_Name(mapintermediate) //get the reduce tasks
+				// if there is already a reduce task, append filename to that reduce task
+				if reduceTask, ok := c.reducing_tasks[reduceTaskID]; ok { //if it is okay to append
+					reduceTask.filesintaskpath = append(reduceTask.filesintaskpath, mapintermediate) //append
+				} else {
+					taskreduce := InformationaboutTask{}                   //else create another map task
+					taskreduce.status = DoingNothingReadyForTask           //needs to be done
+					taskreduce.filesintaskpath = []string{mapintermediate} //give the tasks back
+					c.reducing_tasks[reduceTaskID] = &taskreduce
 				}
 			}
 		}
-		return nil
-	}
+		reply.Gotit = true
 
-	// Walk through the directory and check each file
-	err := filepath.Walk(dirPath, checkFile)
-	if err != nil {
-		fmt.Printf("Error walking through directory: %v\n", err)
-		return false
-	}
+		c.mu.Unlock()
 
-	// Check if all expected files were found
-	for _, found := range expectedFiles {
-		if !found {
-			return false // If any file was not found, return false
-		}
 	}
+	//if reduce phase
+	if args.Phase == Reduce_Phase {
+		reduce_name := args.TaskName                                       //get the task number
+		information_from_reduce_completed := c.reducing_tasks[reduce_name] //information and task
+		c.mu.Lock()                                                        //lock coordinator
+		information_from_reduce_completed.status = Done                    //set this task to done
+		c.mu.Unlock()                                                      //unlock coordinator
+		reply.Gotit = true
 
-	return true // All expected files were found
+	}
+	return nil
 }
 
 // create a Coordinator.
 // mr-main/mrcoordinator.go calls this function.
 // nReduce is the number of reduce tasks to use.
-func MakeCoordinator(files []string, nReduce int) *Coordinator { //takes as input a slice of strings, int for number of reduce tasks
+func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{}
-	fmt.Println("MakeCoordinator")
-	c.file_slice = files          //sets slice of files in Coordinator struct
-	c.reduce_task_count = nReduce //sets reduce_task_count in Coordinator struct
-	c.tasks_to_complete = files
-	c.reduce_tasks_slice = []string{}
-	c.phase = "map"
-	c.map_task_nums = c.initialize_maptasknum_slice()
-	c.reduce_tasks_completed = 1
-
+	c.n_reduces = nReduce                                  //nReduces
+	c.tasks_path_names = files                             //set files
+	c.mapping_tasks = make(map[int]*InformationaboutTask)  //initialize mapping map
+	c.reducing_tasks = make(map[int]*InformationaboutTask) //intialize reducing map
+	for index, entry := range c.tasks_path_names {         //populate the maptask maps
+		maptask := InformationaboutTask{}           //information blank
+		maptask.status = "DoingNothingReadyForTask" //set all tasks as being ready to be completed
+		maptask.filesintaskpath = []string{entry}   //set files in task path
+		c.mapping_tasks[index+1] = &maptask         //next
+	}
+	// Your code here.
+	c.job_completion = false //job is not completed
+	c.waitgroup.Add(1)       //add the waitgroup
+	go c.Checkforfailures()  //start a gortouine that runs in the background every ten seconds to check for stragglers
 	c.server()
 
 	return &c
 }
 
-func remove() {
-	dir := "." // Specify the directory you want to scan
-
-	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
+func (c *Coordinator) Checkforfailures() { //checking for failures
+	for {
+		c.mu.Lock()                   //lock
+		if c.job_completion == true { //if the job is complete no need to check anymore
+			break
 		}
-
-		fileName := info.Name()
-
-		// Check for directories specifically named "reduce" or files that contain "reduce" and end with ".json"
-		if info.IsDir() {
-			if strings.Contains(fileName, "reduce") {
-				// Attempt to remove the directory
-
-				removeErr := os.RemoveAll(path)
-				if removeErr != nil {
-					fmt.Printf("Error removing directory %s: %v\n", path, removeErr)
-					return filepath.SkipDir // Skip this directory since it cannot be removed
+		time_assigned := time.Now()                   //time assigned is now
+		for _, taskdetails := range c.mapping_tasks { //go through all the mapping tasks
+			if taskdetails.status == Working { //if it is working, then we can check if it has exceeded ten seconds
+				if time_assigned.Sub(taskdetails.time_started).Seconds() > (10 * time.Second).Seconds() {
+					taskdetails.status = Fail //if it takes longer than 10 seconds mark as fail
 				}
-				return filepath.SkipDir // Skip to next directory since this one has been removed
-			}
-		} else if strings.Contains(fileName, "reduce") || strings.HasSuffix(fileName, ".json") || strings.Contains(fileName, "temp") {
-			// This is a file that meets the criteria
-
-			removeErr := os.Remove(path)
-			if removeErr != nil {
-				fmt.Printf("Error removing file %s: %v\n", path, removeErr)
 			}
 		}
-
-		return nil
-	})
-
-	if err != nil {
-		fmt.Printf("Error walking through directory %s: %v\n", dir, err)
+		//same logic for the reducing tasks
+		for _, taskdetails := range c.reducing_tasks {
+			if taskdetails.status == Working {
+				if time_assigned.Sub(taskdetails.time_started).Seconds() > (10 * time.Second).Seconds() {
+					taskdetails.status = Fail
+				}
+			}
+		}
+		c.mu.Unlock()                //unlock mutex
+		time.Sleep(time.Second * 10) //sleep for 10 seconds and do it again
 	}
+	c.mu.Unlock()      //unlock
+	c.waitgroup.Done() //waitgroup
 }
 
 // start a thread that listens for RPCs from worker.go
@@ -385,4 +258,5 @@ func (c *Coordinator) server() {
 	}
 	go http.Serve(l, nil)
 }
+
 
