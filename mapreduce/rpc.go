@@ -11,6 +11,39 @@ import (
 	"strconv"
 )
 
+type Phase string //stirng to keep track of which phase
+const (
+	Map_Phase    = "Map"    //mapping phase
+	Reduce_Phase = "Reduce" //reducing phase
+)
+
+type ArgsGivemeTask struct { //worker sends an RPC to the coordinator with a unique worker value to let them know that they can work
+	Uniqueworkervalue string //unique worker value
+}
+
+type ArgsDoneTask struct { //acknowledgement struct
+	Gotit bool //Got it true or false
+}
+type ArgsWorkerSuccess struct { //struct used for success
+	Filenames []string //filenames
+	TaskName  int      //the task completed
+
+	WorkerName string //which worker completed it
+
+	Phase Phase //which phase
+}
+
+type ArgsGotit struct { //struct used for reply
+	Gotit bool //got it if worker acknolowedges the rpc call
+}
+
+type ArgsTasktoComplete struct {
+	TaskName                 int      //task id
+	TasktoCompleteAssignment Phase    //mapping or reducing phase
+	Filenames                []string //give the files
+	Buckets                  int      //nreduce buckets
+}
+
 // example to show how to declare the arguments
 // and reply for an RPC.
 type ExampleArgs struct {
@@ -18,35 +51,6 @@ type ExampleArgs struct {
 }
 type ExampleReply struct {
 	Y int
-}
-
-// Add your RPC definitions here.
-type Args_Worker_Can_Work struct {
-	//The worker can work if value is 1, if not 0
-	Work_Yes_or_No int
-}
-
-type Args_Task_Assignment_to_Worker struct {
-	//send back map task
-	Maporreduce string
-	Reply_path  string
-	Nreduce     int
-	Tasknumber  int
-	Exit        int
-}
-
-type Args_Status struct {
-	SuccessorFailure bool
-	Path             string
-	Map_task_num     int
-}
-
-type Args_Status_Reply struct {
-	Gotit int
-}
-
-type Args_Done struct {
-	Done bool
 }
 
 // Cook up a unique-ish UNIX-domain socket name
